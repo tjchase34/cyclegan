@@ -52,8 +52,9 @@ class CycleGANModel(BaseModel):
         """
         BaseModel.__init__(self, opt)
         # specify the training losses you want to print out. The training/test scripts will call <BaseModel.get_current_losses>
-        self.loss_names = ['D_A', 'G_A', 'cycle_A', 'idt_A', 'D_B', 'G_B', 'cycle_B', 'idt_B']
+        self.loss_names = ['D_A', 'G_A', 'cycle_A', 'idt_A', 'D_B', 'G_B', 'cycle_B', 'idt_B', 'LK_fB', 'LK_rA']
         # specify the images you want to save/display. The training/test scripts will call <BaseModel.get_current_visuals>
+        self.loss_names = ['D_A', 'G_A', 'D_B', 'G_B', 'LK_fB', 'LK_rA']
         visual_names_A = ['real_A', 'fake_B', 'rec_A']
         visual_names_B = ['real_B', 'fake_A', 'rec_B']
         if self.isTrain and self.opt.lambda_identity > 0.0:  # if identity loss is used, we also visualize idt_B=G_A(B) ad idt_A=G_A(B)
@@ -150,7 +151,7 @@ class CycleGANModel(BaseModel):
         fake_A = self.fake_A_pool.query(self.fake_A)
         self.loss_D_B = self.backward_D_basic(self.netD_B, self.real_A, fake_A)
 
-    def backward_G(self):
+    def backward_G(self, label):
         """Calculate the loss for generators G_A and G_B"""
         lambda_idt = self.opt.lambda_identity
         lambda_A = self.opt.lambda_A
@@ -177,17 +178,37 @@ class CycleGANModel(BaseModel):
         self.loss_cycle_B = self.criterionCycle(self.rec_B, self.real_B) * lambda_B
         # combined loss and calculate gradients
         self.loss_G = self.loss_G_A + self.loss_G_B + self.loss_cycle_A + self.loss_cycle_B + self.loss_idt_A + self.loss_idt_B
+
+        ''' Labelled MSE loss - calculate MSE from labels to fake_B and labels to rec_A '''
+        # Extract labelled template indices for loss
+        label = torch.flatten(label)
+        labelled_idxs = torch.flatten(torch.nonzero(label))
+        # Slice out labelled areas on original image, fake B (orbit image), and rec A (reconstructed template image)
+        img_vals = torch.flatten(self.real_A)[labelled_idxs]
+        fake_B_vals = torch.flatten(self.fake_B)[labelled_idxs]
+        rec_A_vals = torch.flatten(self.rec_A)[labelled_idxs]
+        
+        labelKeeping_loss = torch.nn.MSELoss()
+        # labelKeeping_loss = torch.nn.L1Loss()
+        fake_B_labelKeeping_loss = labelKeeping_loss(fake_B_vals, img_vals)
+        rec_A_labelKeeping_loss = labelKeeping_loss(rec_A_vals, img_vals)
+
+        self.loss_LK_fB = fake_B_labelKeeping_loss
+        self.loss_LK_rA = rec_A_labelKeeping_loss
+
+        self.loss_G += fake_B_labelKeeping_loss + rec_A_labelKeeping_loss
+
         self.loss_G.backward()
 
-    def optimize_parameters(self):
+    def optimize_parameters(self, label):
         """Calculate losses, gradients, and update network weights; called in every training iteration"""
         # forward
         self.forward()      # compute fake images and reconstruction images.
         # G_A and G_B
         self.set_requires_grad([self.netD_A, self.netD_B], False)  # Ds require no gradients when optimizing Gs
-        self.optimizer_G.zero_grad()  # set G_A and G_B's gradients to zero
-        self.backward_G()             # calculate gradients for G_A and G_B
-        self.optimizer_G.step()       # update G_A and G_B's weights
+        self.optimizer_G.zero_grad()   # set G_A and G_B's gradients to zero
+        self.backward_G(label) # calculate gradients for G_A and G_B
+        self.optimizer_G.step()        # update G_A and G_B's weights
         # D_A and D_B
         self.set_requires_grad([self.netD_A, self.netD_B], True)
         self.optimizer_D.zero_grad()   # set D_A and D_B's gradients to zero
