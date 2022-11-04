@@ -2,7 +2,7 @@ import argparse
 import os
 from util import util
 import torch
-import models
+import cycmodels
 import data
 
 
@@ -75,7 +75,7 @@ class BaseOptions():
 
         # modify model-related parser options
         model_name = opt.model
-        model_option_setter = models.get_option_setter(model_name)
+        model_option_setter = cycmodels.get_option_setter(model_name)
         parser = model_option_setter(parser, self.isTrain)
         opt, _ = parser.parse_known_args()  # parse again with new defaults
 
@@ -123,7 +123,7 @@ class BaseOptions():
             suffix = ('_' + opt.suffix.format(**vars(opt))) if opt.suffix != '' else ''
             opt.name = opt.name + suffix
 
-        self.print_options(opt)
+        # self.print_options(opt)
 
         # set gpu ids
         str_ids = opt.gpu_ids.split(',')

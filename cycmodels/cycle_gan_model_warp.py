@@ -3,6 +3,11 @@ import itertools
 from util.image_pool import ImagePool
 from .base_model import BaseModel
 from . import networks
+import sys
+sys.path.append('/home/tj/projects/research/sto_seg/')
+from src.models import ResnetSTNGenerator as rsg
+from src.pix2pixHD import GANLoss, VGGLoss, MultiscaleDiscriminator, Vgg19
+from torch import nn
 
 
 class CycleGANModel(BaseModel):
@@ -52,14 +57,15 @@ class CycleGANModel(BaseModel):
         """
         BaseModel.__init__(self, opt)
         # specify the training losses you want to print out. The training/test scripts will call <BaseModel.get_current_losses>
-        self.loss_names = ['D_A', 'G_A', 'cycle_A', 'idt_A', 'D_B', 'G_B', 'cycle_B', 'idt_B', 'LK_fB', 'LK_rA']
+        # self.loss_names = ['D_A', 'G_A', 'cycle_A', 'idt_A', 'D_B', 'G_B', 'cycle_B', 'idt_B']
         # specify the images you want to save/display. The training/test scripts will call <BaseModel.get_current_visuals>
-        self.loss_names = ['D_A', 'G_A', 'D_B', 'G_B', 'LK_fB', 'LK_rA']
+        self.loss_names = ['G_A', 'D_A', 'cycle_A', 'G_B', 'D_B', 'cycle_B']
+
         visual_names_A = ['real_A', 'fake_B', 'rec_A']
         visual_names_B = ['real_B', 'fake_A', 'rec_B']
-        if self.isTrain and self.opt.lambda_identity > 0.0:  # if identity loss is used, we also visualize idt_B=G_A(B) ad idt_A=G_A(B)
-            visual_names_A.append('idt_B')
-            visual_names_B.append('idt_A')
+        # if self.isTrain and self.opt.lambda_identity > 0.0:  # if identity loss is used, we also visualize idt_B=G_A(B) ad idt_A=G_A(B)
+        #     visual_names_A.append('idt_B')
+        #     visual_names_B.append('idt_A')
 
         self.visual_names = visual_names_A + visual_names_B  # combine visualizations for A and B
         # specify the models you want to save to the disk. The training/test scripts will call <BaseModel.save_networks> and <BaseModel.load_networks>.
@@ -68,19 +74,40 @@ class CycleGANModel(BaseModel):
         else:  # during test time, only load Gs
             self.model_names = ['G_A', 'G_B']
 
+        stn_mode = 'truth' # Set behavior of STN layers, one of ['both' | 'full' | 'truth' | 'identity']
+        self.n_stnBlocks = 3
+        self.n_discs = 3
+        self.n_discLayers = 4
+        self.vgg = True
+        self.fm = True
+        self.g_filters = 32
+        self.d_filters = 32
+        self.note = "_cycleTest"
+
+        # Disable Identity loss (color preserving for paintings in paper)
+        self.opt.lambda_identity = 0
+        self.lambda_fm = 5
+        self.lambda_vgg = 2
+
         # define networks (both Generators and discriminators)
         # The naming is different from those used in the paper.
         # Code (vs. paper): G_A (G), G_B (F), D_A (D_Y), D_B (D_X)
-        self.netG_A = networks.define_G(opt.input_nc, opt.output_nc, opt.ngf, opt.netG, opt.norm,
-                                        not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids)
-        self.netG_B = networks.define_G(opt.output_nc, opt.input_nc, opt.ngf, opt.netG, opt.norm,
-                                        not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids)
+        # self.netG_A = networks.define_G(1, 1, self.g_filters, 'resnet_6blocks', 'instance',
+        #                                 not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids)
+        # self.netG_B = networks.define_G(1, 1, self.g_filters, 'resnet_6blocks', 'instance',
+        #                                 not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids)
+
+        self.netG_A = rsg.ResnetSTNGenerator(1, 1, ngf=self.g_filters, norm_layer=nn.InstanceNorm2d, n_blocks=self.n_stnBlocks, stn_mode=stn_mode).cuda()
+        self.netG_B = rsg.ResnetSTNGenerator(1, 1, ngf=self.g_filters, norm_layer=nn.InstanceNorm2d, n_blocks=self.n_stnBlocks, stn_mode=stn_mode).cuda()
 
         if self.isTrain:  # define discriminators
-            self.netD_A = networks.define_D(opt.output_nc, opt.ndf, opt.netD,
-                                            opt.n_layers_D, opt.norm, opt.init_type, opt.init_gain, self.gpu_ids)
-            self.netD_B = networks.define_D(opt.input_nc, opt.ndf, opt.netD,
-                                            opt.n_layers_D, opt.norm, opt.init_type, opt.init_gain, self.gpu_ids)
+            # self.netD_A = networks.define_D(1, self.d_filters, opt.netD,
+            #                                 opt.n_layers_D, opt.norm, opt.init_type, opt.init_gain, self.gpu_ids)
+            # self.netD_B = networks.define_D(1, self.d_filters, opt.netD,
+            #                                 opt.n_layers_D, opt.norm, opt.init_type, opt.init_gain, self.gpu_ids)
+
+            self.netD_A = MultiscaleDiscriminator(1, n_layers=self.n_discLayers, ndf=self.d_filters, num_D=self.n_discs, use_sigmoid=False, getIntermFeat=True).cuda()
+            self.netD_B = MultiscaleDiscriminator(1, n_layers=self.n_discLayers, ndf=self.d_filters, num_D=self.n_discs, use_sigmoid=False, getIntermFeat=True).cuda()
 
         if self.isTrain:
             if opt.lambda_identity > 0.0:  # only works when input and output images have the same number of channels
@@ -88,16 +115,19 @@ class CycleGANModel(BaseModel):
             self.fake_A_pool = ImagePool(opt.pool_size)  # create image buffer to store previously generated images
             self.fake_B_pool = ImagePool(opt.pool_size)  # create image buffer to store previously generated images
             # define loss functions
-            self.criterionGAN = networks.GANLoss(opt.gan_mode).to(self.device)  # define GAN loss.
-            self.criterionCycle = torch.nn.L1Loss()
-            self.criterionIdt = torch.nn.L1Loss()
+            # self.criterionGAN = networks.GANLoss('lsgan').to(self.device)  # define GAN loss.
+            self.criterionGAN = GANLoss(use_lsgan=True).to(self.device)
+            self.criterionFM = torch.nn.L1Loss().to(self.device)
+            self.criterionVGG = VGGLoss().to(self.device)
+            self.criterionCycle = torch.nn.L1Loss().to(self.device)
+            self.criterionIdt = torch.nn.L1Loss().to(self.device)
             # initialize optimizers; schedulers will be automatically created by function <BaseModel.setup>.
             self.optimizer_G = torch.optim.Adam(itertools.chain(self.netG_A.parameters(), self.netG_B.parameters()), lr=opt.lr, betas=(opt.beta1, 0.999))
             self.optimizer_D = torch.optim.Adam(itertools.chain(self.netD_A.parameters(), self.netD_B.parameters()), lr=opt.lr, betas=(opt.beta1, 0.999))
             self.optimizers.append(self.optimizer_G)
             self.optimizers.append(self.optimizer_D)
 
-    def set_input(self, source, target):
+    def set_input(self, source, target, forward_transforms, inverse_transforms):
         """Unpack input data from the dataloader and perform necessary pre-processing steps.
 
         Parameters:
@@ -111,13 +141,15 @@ class CycleGANModel(BaseModel):
         # self.image_paths = input['A_paths' if AtoB else 'B_paths']
         self.real_A = source.to(self.device)
         self.real_B = target.to(self.device)
+        self.forward_transforms = forward_transforms.to(self.device)
+        self.inverse_transforms = inverse_transforms.to(self.device)
 
     def forward(self):
         """Run forward pass; called by both functions <optimize_parameters> and <test>."""
-        self.fake_B = self.netG_A(self.real_A)  # G_A(A)
-        self.rec_A = self.netG_B(self.fake_B)   # G_B(G_A(A))
-        self.fake_A = self.netG_B(self.real_B)  # G_B(B)
-        self.rec_B = self.netG_A(self.fake_A)   # G_A(G_B(B))
+        self.fake_B = self.netG_A(self.real_A, self.forward_transforms)  # G_A(A)
+        self.rec_A = self.netG_B(self.fake_B, self.inverse_transforms)   # G_B(G_A(A))
+        self.fake_A = self.netG_B(self.real_B, self.inverse_transforms)  # G_B(B)
+        self.rec_B = self.netG_A(self.fake_A, self.forward_transforms)   # G_A(G_B(B))
 
     def backward_D_basic(self, netD, real, fake):
         """Calculate GAN loss for the discriminator
@@ -151,7 +183,7 @@ class CycleGANModel(BaseModel):
         fake_A = self.fake_A_pool.query(self.fake_A)
         self.loss_D_B = self.backward_D_basic(self.netD_B, self.real_A, fake_A)
 
-    def backward_G(self, label):
+    def backward_G(self):
         """Calculate the loss for generators G_A and G_B"""
         lambda_idt = self.opt.lambda_identity
         lambda_A = self.opt.lambda_A
@@ -159,10 +191,10 @@ class CycleGANModel(BaseModel):
         # Identity loss
         if lambda_idt > 0:
             # G_A should be identity if real_B is fed: ||G_A(B) - B||
-            self.idt_A = self.netG_A(self.real_B)
+            self.idt_A = self.netG_A(self.real_B, self.forward_transforms)
             self.loss_idt_A = self.criterionIdt(self.idt_A, self.real_B) * lambda_B * lambda_idt
             # G_B should be identity if real_A is fed: ||G_B(A) - A||
-            self.idt_B = self.netG_B(self.real_A)
+            self.idt_B = self.netG_B(self.real_A, self.inverse_transforms)
             self.loss_idt_B = self.criterionIdt(self.idt_B, self.real_A) * lambda_A * lambda_idt
         else:
             self.loss_idt_A = 0
@@ -170,44 +202,74 @@ class CycleGANModel(BaseModel):
 
         # GAN loss D_A(G_A(A))
         self.loss_G_A = self.criterionGAN(self.netD_A(self.fake_B), True)
+        # G_A FM loss 
+        fake_B = self.fake_B_pool.query(self.fake_B)
+        pred_real = self.netD_A(self.real_B)
+        pred_fake = self.netD_A(fake_B.detach())
+        self.loss_G_A_FM = 0
+        for i in range(self.n_discs):
+            for j in range(self.n_discLayers):
+                weight = 1.0 / (2**((self.n_discLayers-1)-i))
+                self.loss_G_A_FM += weight * self.criterionFM(pred_fake[i][j], pred_real[i][j])
+        self.loss_G_A_FM  = self.loss_G_A_FM  * self.lambda_fm
+        # G_A VGG loss
+        self.loss_G_A_VGG = self.criterionVGG(self.fake_B, self.real_B) * self.lambda_vgg
+        self.loss_G_A += self.loss_G_A_FM + self.loss_G_A_VGG
+
         # GAN loss D_B(G_B(B))
         self.loss_G_B = self.criterionGAN(self.netD_B(self.fake_A), True)
+        # G_B FM loss 
+        fake_A = self.fake_A_pool.query(self.fake_A)
+        pred_real = self.netD_B(self.real_A)
+        pred_fake = self.netD_B(fake_A.detach())
+        self.loss_G_B_FM = 0
+        for i in range(self.n_discs):
+            for j in range(self.n_discLayers):
+                weight = 1.0 / (2**((self.n_discLayers-1)-i))
+                self.loss_G_B_FM += weight * self.criterionFM(pred_fake[i][j], pred_real[i][j])
+        self.loss_G_B_FM  = self.loss_G_B_FM  * self.lambda_fm
+        # G_B VGG loss
+        self.loss_G_B_VGG = self.criterionVGG(self.fake_A, self.real_A) * self.lambda_vgg
+        self.loss_G_B += self.loss_G_B_FM + self.loss_G_B_VGG
+
         # Forward cycle loss || G_B(G_A(A)) - A||
         self.loss_cycle_A = self.criterionCycle(self.rec_A, self.real_A) * lambda_A
         # Backward cycle loss || G_A(G_B(B)) - B||
         self.loss_cycle_B = self.criterionCycle(self.rec_B, self.real_B) * lambda_B
+
         # combined loss and calculate gradients
-        self.loss_G = self.loss_G_A + self.loss_G_B + self.loss_cycle_A + self.loss_cycle_B + self.loss_idt_A + self.loss_idt_B
+        # self.loss_G = self.loss_G_A + self.loss_G_B + self.loss_cycle_A + self.loss_cycle_B + self.loss_idt_A + self.loss_idt_B
+        self.loss_G = self.loss_G_A + self.loss_G_B + self.loss_cycle_A + self.loss_cycle_B
 
         ''' Labelled MSE loss - calculate MSE from labels to fake_B and labels to rec_A '''
         # Extract labelled template indices for loss
-        label = torch.flatten(label)
-        labelled_idxs = torch.flatten(torch.nonzero(label))
-        # Slice out labelled areas on original image, fake B (orbit image), and rec A (reconstructed template image)
-        img_vals = torch.flatten(self.real_A)[labelled_idxs]
-        fake_B_vals = torch.flatten(self.fake_B)[labelled_idxs]
-        rec_A_vals = torch.flatten(self.rec_A)[labelled_idxs]
+        # label = torch.flatten(label)
+        # labelled_idxs = torch.flatten(torch.nonzero(label))
+        # # Slice out labelled areas on original image, fake B (orbit image), and rec A (reconstructed template image)
+        # img_vals = torch.flatten(self.real_A)[labelled_idxs]
+        # fake_B_vals = torch.flatten(self.fake_B)[labelled_idxs]
+        # rec_A_vals = torch.flatten(self.rec_A)[labelled_idxs]
         
-        labelKeeping_loss = torch.nn.MSELoss()
-        # labelKeeping_loss = torch.nn.L1Loss()
-        fake_B_labelKeeping_loss = labelKeeping_loss(fake_B_vals, img_vals)
-        rec_A_labelKeeping_loss = labelKeeping_loss(rec_A_vals, img_vals)
+        # labelKeeping_loss = torch.nn.MSELoss()
+        # # labelKeeping_loss = torch.nn.L1Loss()
+        # fake_B_labelKeeping_loss = labelKeeping_loss(fake_B_vals, img_vals)
+        # rec_A_labelKeeping_loss = labelKeeping_loss(rec_A_vals, img_vals)
 
-        self.loss_LK_fB = fake_B_labelKeeping_loss
-        self.loss_LK_rA = rec_A_labelKeeping_loss
+        # self.loss_LK_fB = fake_B_labelKeeping_loss
+        # self.loss_LK_rA = rec_A_labelKeeping_loss
 
-        self.loss_G += fake_B_labelKeeping_loss + rec_A_labelKeeping_loss
+        # self.loss_G += fake_B_labelKeeping_loss + rec_A_labelKeeping_loss
 
         self.loss_G.backward()
 
-    def optimize_parameters(self, label):
+    def optimize_parameters(self):
         """Calculate losses, gradients, and update network weights; called in every training iteration"""
         # forward
         self.forward()      # compute fake images and reconstruction images.
         # G_A and G_B
         self.set_requires_grad([self.netD_A, self.netD_B], False)  # Ds require no gradients when optimizing Gs
         self.optimizer_G.zero_grad()   # set G_A and G_B's gradients to zero
-        self.backward_G(label) # calculate gradients for G_A and G_B
+        self.backward_G() # calculate gradients for G_A and G_B
         self.optimizer_G.step()        # update G_A and G_B's weights
         # D_A and D_B
         self.set_requires_grad([self.netD_A, self.netD_B], True)
