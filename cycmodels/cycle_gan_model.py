@@ -3,6 +3,9 @@ import itertools
 from util.image_pool import ImagePool
 from .base_model import BaseModel
 from . import networks
+from pix2pixHD import VGGLoss, MultiscaleDiscriminator, GANLoss
+from models.ResnetSTNGenerator import ResnetSTNGenerator
+from torch import nn
 
 
 class CycleGANModel(BaseModel):
@@ -75,11 +78,20 @@ class CycleGANModel(BaseModel):
         self.netG_B = networks.define_G(opt.output_nc, opt.input_nc, opt.ngf, opt.netG, opt.norm,
                                         not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids)
 
+        self.n_blocks = 1
+
+        # self.netG_A = ResnetSTNGenerator(opt.input_nc, opt.output_nc, ngf=opt.ngf, norm_layer=nn.InstanceNorm2d, n_blocks=1, stn_mode='truth').cuda()
+        # self.netG_B = ResnetSTNGenerator(opt.input_nc, opt.output_nc, ngf=opt.ngf, norm_layer=nn.InstanceNorm2d, n_blocks=1, stn_mode='truth').cuda()
+
         if self.isTrain:  # define discriminators
-            self.netD_A = networks.define_D(opt.output_nc, opt.ndf, opt.netD,
-                                            opt.n_layers_D, opt.norm, opt.init_type, opt.init_gain, self.gpu_ids)
-            self.netD_B = networks.define_D(opt.input_nc, opt.ndf, opt.netD,
-                                            opt.n_layers_D, opt.norm, opt.init_type, opt.init_gain, self.gpu_ids)
+            # self.netD_A = networks.define_D(opt.output_nc, opt.ndf, opt.netD,
+            #                                 opt.n_layers_D, opt.norm, opt.init_type, opt.init_gain, self.gpu_ids)
+            # self.netD_B = networks.define_D(opt.input_nc, opt.ndf, opt.netD,
+            #                                 opt.n_layers_D, opt.norm, opt.init_type, opt.init_gain, self.gpu_ids)
+
+            self.netD_A = MultiscaleDiscriminator(opt.output_nc, n_layers=4, ndf=opt.ndf, num_D=3, use_sigmoid=False, getIntermFeat=True).cuda()
+            self.netD_B = MultiscaleDiscriminator(opt.output_nc, n_layers=4, ndf=opt.ndf, num_D=3, use_sigmoid=False, getIntermFeat=True).cuda()
+
 
         if self.isTrain:
             if opt.lambda_identity > 0.0:  # only works when input and output images have the same number of channels
@@ -87,16 +99,19 @@ class CycleGANModel(BaseModel):
             self.fake_A_pool = ImagePool(opt.pool_size)  # create image buffer to store previously generated images
             self.fake_B_pool = ImagePool(opt.pool_size)  # create image buffer to store previously generated images
             # define loss functions
-            self.criterionGAN = networks.GANLoss(opt.gan_mode).to(self.device)  # define GAN loss.
-            self.criterionCycle = torch.nn.L1Loss()
-            self.criterionIdt = torch.nn.L1Loss()
+            # self.criterionGAN = networks.GANLoss(opt.gan_mode).to(self.device)  # define GAN loss.
+            self.criterionGAN = GANLoss(use_lsgan=True).cuda()
+            self.criterionCycle = torch.nn.L1Loss().cuda()
+            self.criterionIdt = torch.nn.L1Loss().cuda()
+            self.fm_loss = torch.nn.L1Loss().cuda()
+            self.vgg_loss = VGGLoss().cuda()
             # initialize optimizers; schedulers will be automatically created by function <BaseModel.setup>.
             self.optimizer_G = torch.optim.Adam(itertools.chain(self.netG_A.parameters(), self.netG_B.parameters()), lr=opt.lr, betas=(opt.beta1, 0.999))
             self.optimizer_D = torch.optim.Adam(itertools.chain(self.netD_A.parameters(), self.netD_B.parameters()), lr=opt.lr, betas=(opt.beta1, 0.999))
             self.optimizers.append(self.optimizer_G)
             self.optimizers.append(self.optimizer_D)
 
-    def set_input(self, source, target):
+    def set_input(self, real_A, real_B):
         """Unpack input data from the dataloader and perform necessary pre-processing steps.
 
         Parameters:
@@ -108,11 +123,21 @@ class CycleGANModel(BaseModel):
         # self.real_A = input['A' if AtoB else 'B'].to(self.device)
         # self.real_B = input['B' if AtoB else 'A'].to(self.device)
         # self.image_paths = input['A_paths' if AtoB else 'B_paths']
-        self.real_A = source.to(self.device)
-        self.real_B = target.to(self.device)
+        self.real_A = real_A.to(self.device)
+        # self.fortrans = fortrans.to(self.device)
+        # self.fortran_imgs = fortran_imgs.to(self.device)
+        # self.invtrans = invtrans.to(self.device)
+        # self.invtran_imgs = invtran_imgs.to(self.device)
+        self.real_B = real_B.to(self.device)
 
     def forward(self):
         """Run forward pass; called by both functions <optimize_parameters> and <test>."""
+
+        # self.fake_Bs = self.netG_A(self.real_A, self.fortrans)
+        # self.fake_As = self.netG_B(self.real_B, self.invtrans)
+        # self.rec_Bs = self.netG_A(self.fake_As[:,-1], self.fortrans)
+        # self.rec_As = self.netG_B(self.fake_Bs[:,-1], self.invtrans)
+
         self.fake_B = self.netG_A(self.real_A)  # G_A(A)
         self.rec_A = self.netG_B(self.fake_B)   # G_B(G_A(A))
         self.fake_A = self.netG_B(self.real_B)  # G_B(B)
@@ -150,54 +175,63 @@ class CycleGANModel(BaseModel):
         fake_A = self.fake_A_pool.query(self.fake_A)
         self.loss_D_B = self.backward_D_basic(self.netD_B, self.real_A, fake_A)
 
+    def boosted_loss(self, netD, output, target, lambda_fm=2, lambda_vgg=2):
+
+        pred_real = netD(target)
+        pred_fake = netD(output)
+
+        loss_G_GAN_Feat = 0
+        for i in range(3):
+            for j in range(4):
+                weight = 1.0 / (2**((4-1)-i))
+                loss_G_GAN_Feat += weight * self.fm_loss(pred_fake[i][j], pred_real[i][j].detach())
+        loss_G_GAN_Feat = loss_G_GAN_Feat * lambda_fm
+        
+        # loss_G_VGG = self.vgg_loss(output, target) * lambda_vgg
+    
+        return loss_G_GAN_Feat + 0
+
     def backward_G(self):
         """Calculate the loss for generators G_A and G_B"""
-        lambda_idt = self.opt.lambda_identity
         lambda_A = self.opt.lambda_A
         lambda_B = self.opt.lambda_B
-        # Identity loss
-        if lambda_idt > 0:
-            # G_A should be identity if real_B is fed: ||G_A(B) - B||
-            self.idt_A = self.netG_A(self.real_B)
-            self.loss_idt_A = self.criterionIdt(self.idt_A, self.real_B) * lambda_B * lambda_idt
-            # G_B should be identity if real_A is fed: ||G_B(A) - A||
-            self.idt_B = self.netG_B(self.real_A)
-            self.loss_idt_B = self.criterionIdt(self.idt_B, self.real_A) * lambda_A * lambda_idt
-        else:
-            self.loss_idt_A = 0
-            self.loss_idt_B = 0
+
+        feat_slice_fake_A = -(torch.ones_like(self.real_A))
+        feat_slice_fake_B = -(torch.ones_like(self.real_A))
+        feat_slice_rec_A = -(torch.ones_like(self.real_A))
+        feat_slice_rec_B = -(torch.ones_like(self.real_A))
+
+        feat_slice_fake_B[self.real_A != -1.0] = self.fake_B[self.real_A != -1.0]
+        feat_slice_fake_A[self.real_A != -1.0] = self.fake_A[self.real_A != -1.0]
+        feat_slice_rec_B[self.real_A != -1.0] = self.rec_B[self.real_A != -1.0]
+        feat_slice_rec_A[self.real_A != -1.0] = self.rec_A[self.real_A != -1.0]
+        
+        # Feature loss
+        # feat_loss_A = self.boosted_loss(self.netD_A, feat_slice_fake_B, self.real_A)
+        feat_loss_A = self.boosted_loss(self.netD_A, feat_slice_fake_B, self.real_A) + self.boosted_loss(self.netD_A, feat_slice_rec_B, self.real_A)
+        feat_loss_B = self.boosted_loss(self.netD_B, feat_slice_fake_A, self.real_A) + self.boosted_loss(self.netD_B, feat_slice_rec_A, self.real_A)
+        # feat_loss_B = self.boosted_loss(self.netD_B, feat_slice_fake_A, self.real_A)
+
+
+        '''
+        TODO:
+        1.) just slice* fakeA fakeB, lambda 0.5, 30 epochs
+        2.) all slice* fake/rec A/B, lambda 0.5, 30 epochs
+        '''
+
+
+        lambda_feat = 0.5
 
         # GAN loss D_A(G_A(A))
-        self.loss_G_A = self.criterionGAN(self.netD_A(self.fake_B), True)
+        self.loss_G_A = self.criterionGAN(self.netD_A(self.fake_B), True) + feat_loss_A*lambda_feat
         # GAN loss D_B(G_B(B))
-        self.loss_G_B = self.criterionGAN(self.netD_B(self.fake_A), True)
+        self.loss_G_B = self.criterionGAN(self.netD_B(self.fake_A), True) + feat_loss_B*lambda_feat
         # Forward cycle loss || G_B(G_A(A)) - A||
         self.loss_cycle_A = self.criterionCycle(self.rec_A, self.real_A) * lambda_A
         # Backward cycle loss || G_A(G_B(B)) - B||
         self.loss_cycle_B = self.criterionCycle(self.rec_B, self.real_B) * lambda_B
         # combined loss and calculate gradients
-        # self.loss_G = self.loss_G_A + self.loss_G_B + self.loss_cycle_A + self.loss_cycle_B + self.loss_idt_A + self.loss_idt_B
         self.loss_G = self.loss_G_A + self.loss_G_B + self.loss_cycle_A + self.loss_cycle_B
-
-        ''' Labelled MSE loss - calculate MSE from labels to fake_B and labels to rec_A '''
-        # Extract labelled template indices for loss
-        # label = torch.flatten(label)
-        # labelled_idxs = torch.flatten(torch.nonzero(label))
-        # # Slice out labelled areas on original image, fake B (orbit image), and rec A (reconstructed template image)
-        # img_vals = torch.flatten(self.real_A)[labelled_idxs]
-        # fake_B_vals = torch.flatten(self.fake_B)[labelled_idxs]
-        # rec_A_vals = torch.flatten(self.rec_A)[labelled_idxs]
-        
-        # labelKeeping_loss = torch.nn.MSELoss()
-        # # labelKeeping_loss = torch.nn.L1Loss()
-        # fake_B_labelKeeping_loss = labelKeeping_loss(fake_B_vals, img_vals)
-        # rec_A_labelKeeping_loss = labelKeeping_loss(rec_A_vals, img_vals)
-
-        # self.loss_LK_fB = fake_B_labelKeeping_loss
-        # self.loss_LK_rA = rec_A_labelKeeping_loss
-
-        # self.loss_G += fake_B_labelKeeping_loss + rec_A_labelKeeping_loss
-
         self.loss_G.backward(retain_graph=True)
 
     def optimize_parameters(self):
